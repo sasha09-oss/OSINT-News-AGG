@@ -1,0 +1,17 @@
+{
+  "name": "osint-news-aggregator",
+  "version": "1.0.0",
+  "description": "Agregador de noticias OSINT con resumen por IA - Cloudflare Worker",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "trigger": "wrangler trigger",
+    "secret:gemini": "wrangler secret put GEMINI_API_KEY",
+    "secret:email": "wrangler secret put EMAIL_API_KEY"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

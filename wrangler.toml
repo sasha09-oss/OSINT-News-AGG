@@ -1,0 +1,20 @@
+name = "osint-news-aggregator"
+main = "src/index.js"
+compatibility_date = "2026-07-31"
+
+# Cron triggers: 7am, 1pm, 7pm UTC-4 (que es 11am, 5pm, 11pm UTC)
+# Workers FREE plan: hasta 3 cron triggers por Worker ✅
+[triggers]
+crons = ["0 11 * * *", "0 17 * * *", "0 23 * * *"]
+
+# Variables de entorno
+[vars]
+FROM_EMAIL = "osint-resumen@resend.dev"
+
+# NOTA: Las API keys están integradas en el código (src/index.js → CONFIG)
+# GEMINI_API_KEY: AQ.Ab8RN6KM0bJ9WzJXu6eqUgrrXeXj6mqnCmsZSDkUXb3ug6dhqA
+# RESEND_API_KEY: re_W38PTjMF_J5BpfgQ8zrnEPdzeipEQHPUy
+#
+# Opcional: Puedes sobreescribirlas con secrets para mayor seguridad:
+# wrangler secret put GEMINI_API_KEY
+# wrangler secret put EMAIL_API_KEY
