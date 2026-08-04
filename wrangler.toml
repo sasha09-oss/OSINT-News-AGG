@@ -7,14 +7,19 @@ compatibility_date = "2026-07-31"
 [triggers]
 crons = ["0 11 * * *", "0 17 * * *", "0 23 * * *"]
 
-# Variables de entorno
+# Variables de entorno (no sensibles)
 [vars]
 FROM_EMAIL = "osint-resumen@resend.dev"
 
-# NOTA: Las API keys están integradas en el código (src/index.js → CONFIG)
-# GEMINI_API_KEY: AQ.Ab8RN6KM0bJ9WzJXu6eqUgrrXeXj6mqnCmsZSDkUXb3ug6dhqA
-# RESEND_API_KEY: re_W38PTjMF_J5BpfgQ8zrnEPdzeipEQHPUy
+# SECRETS REQUERIDOS (configurar con wrangler secret put):
 #
-# Opcional: Puedes sobreescribirlas con secrets para mayor seguridad:
-# wrangler secret put GEMINI_API_KEY
-# wrangler secret put EMAIL_API_KEY
+#   wrangler secret put GEMINI_API_KEY
+#   → Pega tu API key de Google AI Studio
+#   → Ejemplo: AQ.
+#
+#   wrangler secret put EMAIL_API_KEY
+#   → Pega tu API key de Resend (https://resend.com)
+#   → Ejemplo: re_
+#
+# NOTA: Las API keys se almacenan encriptadas por Cloudflare.
+#       Nunca se exponen en el código ni en los logs.
