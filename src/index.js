@@ -6,10 +6,9 @@
 
 // ===================== CONFIGURACIÓN =====================
 const CONFIG = {
-  // API Keys integradas (hardcodeadas para uso directo)
-  // Para mayor seguridad en producción, usa wrangler secret put
-  GEMINI_API_KEY: 'AQ.Ab8RN6KM0bJ9WzJXu6eqUgrrXeXj6mqnCmsZSDkUXb3ug6dhqA',
-  RESEND_API_KEY: 're_W38PTjMF_J5BpfgQ8zrnEPdzeipEQHPUy',
+  // API Keys se configuran via Cloudflare Secrets (wrangler secret put)
+  // GEMINI_API_KEY  -> wrangler secret put GEMINI_API_KEY
+  // EMAIL_API_KEY   -> wrangler secret put EMAIL_API_KEY (Resend)
 
   GEMINI_MODEL: 'gemini-2.0-flash',
   GEMINI_URL: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
