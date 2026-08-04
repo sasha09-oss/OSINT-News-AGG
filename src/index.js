@@ -5,15 +5,22 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ===================== CONFIGURACIÓN =====================
+// Las API keys se leen SIEMPRE desde env/secrets. Aliases soportados:
+//   Gemini: GEMINI_API_KEY | GEMINI_KEY | GOOGLE_AI_API_KEY
+//   Email:  EMAIL_API_KEY | RESEND_API_KEY
+function obtenerApiKey(env, nombres) {
+  if (!env) return undefined;
+  for (const n of nombres) {
+    if (env[n]) return env[n];
+  }
+  return undefined;
+}
+
 const CONFIG = {
-  // API Keys se configuran via Cloudflare Secrets (wrangler secret put)
-  // GEMINI_API_KEY  -> wrangler secret put GEMINI_API_KEY
-  // EMAIL_API_KEY   -> wrangler secret put EMAIL_API_KEY (Resend)
-
   GEMINI_MODEL: 'gemini-2.0-flash',
-  GEMINI_URL: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
+  GEMINI_URL:
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
 
-  // Correos destino (incluyendo el nuevo)
   EMAILS_DESTINO: [
     'maxrivero783@proton.me',
     'comunicacionestrategica2026@proton.me',
@@ -25,8 +32,9 @@ const CONFIG = {
 
   MAX_ITEMS_POR_FEED: 5,
   MAX_NOTICIAS_TOTAL: 150,
-  FETCH_TIMEOUT_MS: 12000, // 12 segundos timeout por petición
-  MAX_FETCH_RETRIES: 2,
+  FETCH_TIMEOUT_MS: 8000,
+  MAX_FETCH_RETRIES: 1,
+  MAX_CONCURRENCIA: 8,
 };
 
 // ===================== FEEDS RSS =====================
@@ -136,7 +144,7 @@ const FEEDS_CUBA_TEMATICOS = [
   'https://news.google.com/rss/search?q=Cuba+Texas+New+Jersey+comunidad&hl=es&gl=US&ceid=US:es',
   'https://news.google.com/rss/search?q=politica+interna+EEUU+escandalos&hl=es&gl=US&ceid=US:es',
   'https://news.google.com/rss/search?q=Epstein+archivos+noticias&hl=es&gl=US&ceid=US:es',
-  'https://news.google.com/rss/search?q=EEUU+elecciones+campañas&hl=es&gl=US&ceid=US:es',
+  'https://news.google.com/rss/search?q=EEUU+elecciones+campanas&hl=es&gl=US&ceid=US:es',
   'https://news.google.com/rss/search?q=Florida+politica+inmigracion&hl=es&gl=US&ceid=US:es',
   'https://news.google.com/rss/search?q=diaspora+cubana+Florida+Texas&hl=es&gl=US&ceid=US:es',
 ];
@@ -148,50 +156,85 @@ const TODOS_LOS_FEEDS = [
   ...FEEDS_LATAM,
   ...FEEDS_CONFLICTOS,
   ...FEEDS_TECNOLOGIA,
-  ...FEEDS_CUBA_TEMATICOS
+  ...FEEDS_CUBA_TEMATICOS,
 ];
 
-// ===================== UTILIDADES ANTIBUG =====================
+// ===================== UTILIDADES =====================
 
-/**
- * Fetch con timeout y reintentos automáticos
- * @param {string} url - URL a fetch
- * @param {object} options - Opciones de fetch
- * @param {number} retries - Reintentos restantes
- */
-async function fetchRobusto(url, options = {}, retries = CONFIG.MAX_FETCH_RETRIES) {
+const USER_AGENT_BROWSER =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
+  'Chrome/124.0.0.0 Safari/537.36';
+
+function normalizarUrl(url) {
+  try {
+    return new URL(url).toString();
+  } catch {
+    // Si tiene caracteres no-ASCII sin codificar, hacemos una codificación best-effort
+    return encodeURI(url);
+  }
+}
+
+async function fetchRobusto(url, options, retries) {
+  options = options || {};
+  if (retries === undefined) retries = CONFIG.MAX_FETCH_RETRIES;
+  const urlFinal = normalizarUrl(url);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), CONFIG.FETCH_TIMEOUT_MS);
+  const timeoutId = setTimeout(function () { controller.abort(); }, CONFIG.FETCH_TIMEOUT_MS);
 
   try {
-    const response = await fetch(url, {
-      ...options,
+    const response = await fetch(urlFinal, {
+      method: options.method || 'GET',
+      body: options.body || undefined,
       signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; OSINT-Bot/1.0)',
-        ...options.headers,
-      },
+      headers: Object.assign(
+        {
+          'User-Agent': USER_AGENT_BROWSER,
+          Accept:
+            'text/html,application/xhtml+xml,application/xml;q=0.9,application/rss+xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
+        },
+        options.headers || {}
+      ),
     });
     clearTimeout(timeoutId);
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
     if (retries > 0 && (error.name === 'AbortError' || error.name === 'TypeError')) {
-      console.log(`[REINTENTO] ${url} (${retries} restantes)`);
-      await sleep(1000 * (CONFIG.MAX_FETCH_RETRIES - retries + 1)); // Backoff exponencial simple
-      return fetchRobusto(url, options, retries - 1);
+      console.log('[REINTENTO] ' + urlFinal.substring(0, 80) + ' (' + retries + ' restantes)');
+      await sleep(800 * (CONFIG.MAX_FETCH_RETRIES - retries + 1));
+      return fetchRobusto(urlFinal, options, retries - 1);
     }
     throw error;
   }
 }
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+async function mapConcurrente(arr, limite, fn) {
+  const resultados = new Array(arr.length);
+  let i = 0;
+  const n = Math.min(limite, arr.length);
+  const workers = new Array(n).fill(0).map(async function () {
+    while (true) {
+      const idx = i++;
+      if (idx >= arr.length) return;
+      try {
+        resultados[idx] = { status: 'fulfilled', value: await fn(arr[idx], idx) };
+      } catch (e) {
+        resultados[idx] = { status: 'rejected', reason: e };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return resultados;
 }
 
 function limpiarTexto(texto) {
   if (!texto) return '';
-  return texto
+  return String(texto)
     .replace(/<[^>]*>/g, '')
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
@@ -203,163 +246,206 @@ function limpiarTexto(texto) {
 }
 
 function extraerDominio(url) {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return url;
-  }
+  try { return new URL(url).hostname; } catch { return url; }
 }
 
 function generarIdUnico() {
   return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
 }
 
-// ===================== PARSER XML SIN DEPENDENCIAS =====================
+// ===================== PARSER XML =====================
+// Usa DOMParser nativo si está disponible; si no, un extractor por regex.
 
-/**
- * Parser XML simple y robusto usando DOMParser nativo del Worker
- */
-function parseXML(xmlText) {
+let _domParserDisponible = null;
+
+function domParserDisponible() {
+  if (_domParserDisponible !== null) return _domParserDisponible;
+  // @ts-ignore
+  if (typeof DOMParser === 'undefined') {
+    _domParserDisponible = false;
+    return false;
+  }
   try {
+    // @ts-ignore
+    const p = new DOMParser();
+    const d = p.parseFromString('<a><b>x</b></a>', 'application/xml');
+    if (d.querySelector('parsererror')) throw new Error('pe');
+    _domParserDisponible = true;
+    return true;
+  } catch {
+    _domParserDisponible = false;
+    return false;
+  }
+}
+
+function parseXML(xmlText) {
+  if (!domParserDisponible()) {
+    return { _fallback: true, raw: xmlText };
+  }
+  try {
+    // @ts-ignore
     const parser = new DOMParser();
     const doc = parser.parseFromString(xmlText, 'application/xml');
-
-    // Verificar si hay error de parseo
-    const parseError = doc.querySelector('parsererror');
-    if (parseError) {
-      throw new Error('XML parse error: ' + parseError.textContent);
+    if (doc.querySelector('parsererror')) {
+      return { _fallback: true, raw: xmlText };
     }
-
     return doc;
-  } catch (e) {
-    throw new Error('Error parseando XML: ' + e.message);
+  } catch {
+    return { _fallback: true, raw: xmlText };
   }
+}
+
+// Regex reutilizables (construidos una sola vez, evita problemas de escape en templates)
+var RE_ITEM_RSS = /<item[\s>][\s\S]*?<\/item>/gi;
+var RE_ITEM_ATOM = /<entry[\s>][\s\S]*?<\/entry>/gi;
+var RE_IS_ATOM = /<feed[\s>]/i;
+
+function _campo(blk, tag) {
+  // <tag>texto</tag> o <tag><![CDATA[texto]]></tag>
+  var re = new RegExp(
+    '<' + tag + '(?:[\\s][^>]*)?>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</' + tag + '>',
+    'i'
+  );
+  var m = blk.match(re);
+  if (m) return m[1].trim();
+  // <link href="..."/>
+  var reAttr = new RegExp('<' + tag + '[^>]*href=["\']([^"\']+)["\']', 'i');
+  var ma = blk.match(reAttr);
+  return ma ? ma[1].trim() : '';
 }
 
 function extraerItemsRSS(doc, maxItems) {
-  const items = [];
+  var items = [];
 
-  // Intentar formato RSS 2.0
-  let entries = doc.querySelectorAll('item');
-
-  // Si no hay items, intentar formato Atom
-  if (entries.length === 0) {
-    entries = doc.querySelectorAll('entry');
-  }
-
-  const limit = Math.min(entries.length, maxItems);
-
-  for (let i = 0; i < limit; i++) {
-    const entry = entries[i];
-    try {
-      let titulo = '';
-      let link = '';
-      let fecha = '';
-      let fuente = '';
-
-      if (entry.tagName === 'entry') {
-        // Formato Atom
-        titulo = entry.querySelector('title')?.textContent || '';
-        const linkEl = entry.querySelector('link');
-        link = linkEl?.getAttribute('href') || linkEl?.textContent || '';
-        fecha = entry.querySelector('published')?.textContent || 
-                entry.querySelector('updated')?.textContent || '';
-        fuente = entry.querySelector('author name')?.textContent || 
-                 entry.querySelector('author')?.textContent || '';
-      } else {
-        // Formato RSS
-        titulo = entry.querySelector('title')?.textContent || '';
-        link = entry.querySelector('link')?.textContent || '';
-        fecha = entry.querySelector('pubDate')?.textContent || '';
-        fuente = entry.querySelector('source')?.textContent || '';
-      }
-
+  if (doc && doc._fallback) {
+    var raw = doc.raw;
+    var esAtom = RE_IS_ATOM.test(raw);
+    var reItems = esAtom ? RE_ITEM_ATOM : RE_ITEM_RSS;
+    var matches = raw.match(reItems) || [];
+    var limit = Math.min(matches.length, maxItems);
+    for (var i = 0; i < limit; i++) {
+      var blk = matches[i];
+      var titulo = _campo(blk, 'title');
+      var link = _campo(blk, 'link');
+      var fecha = _campo(blk, esAtom ? 'published' : 'pubDate') || _campo(blk, 'updated');
+      var fuente = _campo(blk, 'source') || _campo(blk, 'dc:creator');
+      if (esAtom && !fuente) fuente = _campo(blk, 'name');
       if (titulo && titulo.trim().length > 0) {
         items.push({
           titulo: limpiarTexto(titulo),
-          link: link.trim(),
-          fecha: fecha.trim(),
-          fuente: fuente.trim() || 'N/D',
+          link: (link || '').trim(),
+          fecha: (fecha || '').trim(),
+          fuente: (fuente || 'N/D').trim(),
+        });
+      }
+    }
+    return items;
+  }
+
+  var entries = doc.querySelectorAll('item');
+  if (entries.length === 0) entries = doc.querySelectorAll('entry');
+  var l = Math.min(entries.length, maxItems);
+  for (var j = 0; j < l; j++) {
+    var entry = entries[j];
+    try {
+      var t, lk, fe, fu;
+      var tag = entry.tagName ? entry.tagName.toLowerCase() : '';
+      if (tag === 'entry') {
+        t = entry.querySelector('title') ? entry.querySelector('title').textContent : '';
+        var linkEl = entry.querySelector('link');
+        lk = linkEl ? linkEl.getAttribute('href') || linkEl.textContent : '';
+        fe =
+          (entry.querySelector('published') && entry.querySelector('published').textContent) ||
+          (entry.querySelector('updated') && entry.querySelector('updated').textContent) ||
+          '';
+        var authorName = entry.querySelector('author > name');
+        fu =
+          (authorName && authorName.textContent) ||
+          (entry.querySelector('author') && entry.querySelector('author').textContent) ||
+          '';
+      } else {
+        t = entry.querySelector('title') ? entry.querySelector('title').textContent : '';
+        lk = entry.querySelector('link') ? entry.querySelector('link').textContent : '';
+        fe = entry.querySelector('pubDate') ? entry.querySelector('pubDate').textContent : '';
+        fu = entry.querySelector('source') ? entry.querySelector('source').textContent : '';
+      }
+      if (t && t.trim().length > 0) {
+        items.push({
+          titulo: limpiarTexto(t),
+          link: (lk || '').trim(),
+          fecha: (fe || '').trim(),
+          fuente: (fu || 'N/D').trim(),
         });
       }
     } catch (e) {
-      console.log(`[WARN] Error procesando item RSS: ${e.message}`);
-      // Continuar con el siguiente item
+      console.log('[WARN] Error procesando item RSS: ' + e.message);
     }
   }
-
   return items;
 }
 
-// ===================== OBTENER NOTICIAS DE RSS (ROBUSTO) =====================
+// ===================== OBTENER NOTICIAS RSS =====================
+async function obtenerNoticiasRSS() {
+  var items = [];
+  var feedsExitosos = 0;
+  var feedsFallidos = 0;
 
-async function obtenerNoticiasRSS(env) {
-  const items = [];
-  let feedsExitosos = 0;
-  let feedsFallidos = 0;
+  var resultados = await mapConcurrente(TODOS_LOS_FEEDS, CONFIG.MAX_CONCURRENCIA, async function (
+    url
+  ) {
+    var response = await fetchRobusto(url);
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    var contentText = await response.text();
+    if (!contentText || contentText.length < 50) {
+      throw new Error('Contenido vacío o demasiado corto');
+    }
+    var doc = parseXML(contentText);
+    var feedItems = extraerItemsRSS(doc, CONFIG.MAX_ITEMS_POR_FEED);
+    if (feedItems.length === 0) throw new Error('Sin entradas RSS/Atom');
+    feedItems.forEach(function (item) {
+      if (!item.fuente || item.fuente === 'N/D') item.fuente = extraerDominio(url);
+    });
+    return { url: url, feedItems: feedItems };
+  });
 
-  for (let i = 0; i < TODOS_LOS_FEEDS.length; i++) {
-    const url = TODOS_LOS_FEEDS[i];
-    try {
-      const response = await fetchRobusto(url);
-
-      if (!response.ok) {
-        console.log(`⚠️ HTTP ${response.status} feed #${i + 1}: ${url.substring(0, 80)}...`);
-        feedsFallidos++;
-        continue; // ← SIGUIENTE FEED
-      }
-
-      const contentText = await response.text();
-      if (!contentText || contentText.length < 50) {
-        console.log(`⚠️ Contenido vacío feed #${i + 1}: ${url.substring(0, 80)}...`);
-        feedsFallidos++;
-        continue; // ← SIGUIENTE FEED
-      }
-
-      let doc;
-      try {
-        doc = parseXML(contentText);
-      } catch (e) {
-        console.log(`⚠️ XML inválido feed #${i + 1}: ${url.substring(0, 80)}... -> ${e.message}`);
-        feedsFallidos++;
-        continue; // ← SIGUIENTE FEED
-      }
-
-      const feedItems = extraerItemsRSS(doc, CONFIG.MAX_ITEMS_POR_FEED);
-
-      if (feedItems.length === 0) {
-        console.log(`⚠️ Sin entradas feed #${i + 1}: ${url.substring(0, 80)}...`);
-        feedsFallidos++;
-        continue; // ← SIGUIENTE FEED
-      }
-
-      // Agregar fuente si no viene
-      feedItems.forEach(item => {
-        if (!item.fuente || item.fuente === 'N/D') {
-          item.fuente = extraerDominio(url);
-        }
-        items.push(item);
-      });
-
+  for (var i = 0; i < resultados.length; i++) {
+    var r = resultados[i];
+    var url = TODOS_LOS_FEEDS[i];
+    if (r.status === 'fulfilled') {
+      items.push.apply(items, r.value.feedItems);
       feedsExitosos++;
-      console.log(`✅ Feed #${i + 1} OK: ${feedItems.length} noticias | ${url.substring(0, 60)}...`);
-
-    } catch (e) {
-      console.log(`❌ Feed #${i + 1} FALLÓ: ${url.substring(0, 80)}... -> ${e.message}`);
+      console.log(
+        '✅ Feed #' +
+          (i + 1) +
+          ' OK: ' +
+          r.value.feedItems.length +
+          ' noticias | ' +
+          url.substring(0, 60) +
+          '...'
+      );
+    } else {
       feedsFallidos++;
-      // ← SIGUIENTE FEED (no throw, no break)
+      console.log(
+        '❌ Feed #' +
+          (i + 1) +
+          ' FALLÓ: ' +
+          url.substring(0, 70) +
+          '... -> ' +
+          r.reason.message
+      );
     }
   }
 
-  console.log(`📊 RSS: ${feedsExitosos} exitosos, ${feedsFallidos} fallidos, ${items.length} noticias`);
+  console.log(
+    '📊 RSS: ' + feedsExitosos + ' exitosos, ' + feedsFallidos + ' fallidos, ' + items.length + ' noticias'
+  );
   return items;
 }
 
-// ===================== GDELT API (ROBUSTO) =====================
-
-async function obtenerNoticiasGDELT(env) {
-  const items = [];
-  const temasGDELT = [
+// ===================== GDELT =====================
+async function obtenerNoticiasGDELT() {
+  var items = [];
+  var temas = [
     'Cuba',
     'Marco Rubio',
     'Donald Trump Cuba',
@@ -370,52 +456,57 @@ async function obtenerNoticiasGDELT(env) {
     'Iran Israel conflict',
     'OSINT',
     'cybersecurity',
-    'artificial intelligence'
+    'artificial intelligence',
   ];
 
-  for (let i = 0; i < temasGDELT.length; i++) {
-    const tema = temasGDELT[i];
+  var resultados = await mapConcurrente(temas, 6, async function (tema) {
+    var q = encodeURIComponent('"' + tema + '" sourcelang:english');
+    var url =
+      'https://api.gdeltproject.org/api/v2/doc/doc?query=' +
+      q +
+      '&mode=ArtList&maxrecords=10&format=json&timespan=12h';
+    var response = await fetchRobusto(url);
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    var text = await response.text();
+    var data;
     try {
-      const query = encodeURIComponent(tema);
-      const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${query}&mode=ArtList&maxrecords=10&format=json`;
+      data = JSON.parse(text);
+    } catch {
+      throw new Error('Respuesta no es JSON (posible rate-limit HTML)');
+    }
+    var articulos = data.articles && Array.isArray(data.articles) ? data.articles : [];
+    return { tema: tema, articulos: articulos };
+  });
 
-      const response = await fetchRobusto(url);
-
-      if (!response.ok) {
-        console.log(`⚠️ GDELT HTTP ${response.status} para tema: ${tema}`);
-        continue; // ← SIGUIENTE TEMA
-      }
-
-      const data = await response.json();
-      if (data.articles && Array.isArray(data.articles)) {
-        data.articles.forEach(article => {
-          if (article.title) {
-            items.push({
-              titulo: limpiarTexto(article.title),
-              link: article.url || '',
-              fecha: article.seendate || '',
-              fuente: article.domain || 'GDELT',
-            });
-          }
-        });
-        console.log(`✅ GDELT tema #${i + 1} (${tema}): ${data.articles.length} artículos`);
-      }
-    } catch (e) {
-      console.log(`❌ GDELT tema #${i + 1} (${tema}) FALLÓ: ${e.message}`);
-      // ← SIGUIENTE TEMA
+  for (var i = 0; i < resultados.length; i++) {
+    var r = resultados[i];
+    var tema = temas[i];
+    if (r.status === 'fulfilled') {
+      r.value.articulos.forEach(function (article) {
+        if (article.title) {
+          items.push({
+            titulo: limpiarTexto(article.title),
+            link: article.url || '',
+            fecha: article.seendate || '',
+            fuente: article.domain || 'GDELT',
+          });
+        }
+      });
+      console.log('✅ GDELT tema #' + (i + 1) + ' (' + tema + '): ' + r.value.articulos.length + ' artículos');
+    } else {
+      console.log('❌ GDELT tema #' + (i + 1) + ' (' + tema + ') FALLÓ: ' + r.reason.message);
     }
   }
 
-  console.log(`📊 GDELT total: ${items.length} noticias`);
+  console.log('📊 GDELT total: ' + items.length + ' noticias');
   return items;
 }
 
-// ===================== BÚSQUEDA WEB (ROBUSTO) =====================
-
-async function obtenerNoticiasBusquedaWeb(env) {
-  const items = [];
-
-  const busquedas = [
+// ===================== WEB SEARCH =====================
+async function obtenerNoticiasBusquedaWeb() {
+  var items = [];
+  var busquedas = [
+    'Cuba news',
     'site:nytimes.com Cuba',
     'site:wsj.com Cuba',
     'site:washingtonpost.com Cuba',
@@ -431,6 +522,7 @@ async function obtenerNoticiasBusquedaWeb(env) {
     'site:diariodecuba.com',
     'site:cubanet.org',
     'site:adncuba.com',
+    'site:periodicocubano.com',
     'site:granma.cu',
     'site:cubadebate.cu',
     'Marco Rubio Cuba',
@@ -438,236 +530,203 @@ async function obtenerNoticiasBusquedaWeb(env) {
     'Cuba migration Florida',
     'Cuban exile diaspora',
     'Epstein files',
-    'Ukraine Russia war',
-    'Iran Israel conflict',
-    'OSINT tools',
+    'Ukraine Russia war latest',
+    'Iran Israel conflict latest',
+    'OSINT tools news',
     'cybersecurity news',
     'artificial intelligence news',
   ];
 
-  for (let i = 0; i < busquedas.length; i++) {
-    const query = busquedas[i];
-    try {
-      const encodedQuery = encodeURIComponent(query);
-      const url = `https://news.google.com/rss/search?q=${encodedQuery}&hl=en&gl=US&ceid=US:en`;
+  var resultados = await mapConcurrente(busquedas, 8, async function (query) {
+    var url =
+      'https://news.google.com/rss/search?q=' +
+      encodeURIComponent(query) +
+      '&hl=es&gl=US&ceid=US:es';
+    var response = await fetchRobusto(url);
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    var text = await response.text();
+    var doc = parseXML(text);
+    if (!doc._fallback) {
+      var channel = doc.querySelector('channel');
+      if (!channel) throw new Error('Sin canal RSS');
+    }
+    var encontrados = extraerItemsRSS(doc, 3).map(function (it) {
+      return {
+        titulo: it.titulo,
+        link: it.link,
+        fecha: it.fecha,
+        fuente: it.fuente === 'N/D' ? 'Google News' : it.fuente,
+      };
+    });
+    if (encontrados.length === 0) throw new Error('Sin items parseables en RSS de búsqueda');
+    return { query: query, encontrados: encontrados };
+  });
 
-      const response = await fetchRobusto(url);
-
-      if (!response.ok) {
-        console.log(`⚠️ Web Search HTTP ${response.status} para: ${query.substring(0, 60)}`);
-        continue; // ← SIGUIENTE BÚSQUEDA
-      }
-
-      let doc;
-      try {
-        const text = await response.text();
-        doc = parseXML(text);
-      } catch (e) {
-        console.log(`⚠️ XML inválido en búsqueda: ${query.substring(0, 60)} -> ${e.message}`);
-        continue; // ← SIGUIENTE BÚSQUEDA
-      }
-
-      const channel = doc.querySelector('channel');
-      if (!channel) {
-        console.log(`⚠️ Sin canal RSS en búsqueda: ${query.substring(0, 60)}`);
-        continue; // ← SIGUIENTE BÚSQUEDA
-      }
-
-      const entries = channel.querySelectorAll('item');
-      let count = 0;
-
-      for (let j = 0; j < Math.min(entries.length, 3); j++) {
-        try {
-          const item = entries[j];
-          const titulo = item.querySelector('title')?.textContent;
-          const link = item.querySelector('link')?.textContent;
-          const fecha = item.querySelector('pubDate')?.textContent;
-          const fuente = item.querySelector('source')?.textContent;
-
-          if (titulo) {
-            items.push({
-              titulo: limpiarTexto(titulo),
-              link: link || '',
-              fecha: fecha || '',
-              fuente: fuente || 'Google News',
-            });
-            count++;
-          }
-        } catch (e) {
-          console.log(`  ⚠️ Error en item de búsqueda: ${e.message}`);
-        }
-      }
-
-      console.log(`✅ Web #${i + 1} (${query.substring(0, 40)}...): ${count} noticias`);
-
-    } catch (e) {
-      console.log(`❌ Web #${i + 1} (${query.substring(0, 40)}...) FALLÓ: ${e.message}`);
-      // ← SIGUIENTE BÚSQUEDA
+  for (var i = 0; i < resultados.length; i++) {
+    var r = resultados[i];
+    var query = busquedas[i];
+    if (r.status === 'fulfilled') {
+      items.push.apply(items, r.value.encontrados);
+      console.log(
+        '✅ Web #' +
+          (i + 1) +
+          ' (' +
+          query.substring(0, 40) +
+          '...): ' +
+          r.value.encontrados.length +
+          ' noticias'
+      );
+    } else {
+      console.log(
+        '❌ Web #' + (i + 1) + ' (' + query.substring(0, 40) + '...) FALLÓ: ' + r.reason.message
+      );
     }
   }
 
-  console.log(`📊 Web Search total: ${items.length} noticias`);
+  console.log('📊 Web Search total: ' + items.length + ' noticias');
   return items;
 }
 
 // ===================== FUNCIÓN COMBINADA =====================
-
-async function obtenerTodasLasNoticias(env) {
+async function obtenerTodasLasNoticias() {
   console.log('🚀 Iniciando recolección de noticias...');
 
-  const [noticiasRSS, noticiasGDELT, noticiasWeb] = await Promise.allSettled([
-    obtenerNoticiasRSS(env),
-    obtenerNoticiasGDELT(env),
-    obtenerNoticiasBusquedaWeb(env),
+  var res = await Promise.allSettled([
+    obtenerNoticiasRSS(),
+    obtenerNoticiasGDELT(),
+    obtenerNoticiasBusquedaWeb(),
   ]);
+  var resRSS = res[0];
+  var resGDELT = res[1];
+  var resWeb = res[2];
 
-  const todas = [];
+  var diagnostico = {
+    rss: resRSS.status === 'fulfilled' ? resRSS.value.length : 'FAIL: ' + (resRSS.reason && resRSS.reason.message ? resRSS.reason.message : ''),
+    gdelt: resGDELT.status === 'fulfilled' ? resGDELT.value.length : 'FAIL: ' + (resGDELT.reason && resGDELT.reason.message ? resGDELT.reason.message : ''),
+    web: resWeb.status === 'fulfilled' ? resWeb.value.length : 'FAIL: ' + (resWeb.reason && resWeb.reason.message ? resWeb.reason.message : ''),
+    domparser: domParserDisponible() ? 'disponible' : 'NO disponible (usa fallback regex)',
+  };
 
-  if (noticiasRSS.status === 'fulfilled') {
-    todas.push(...noticiasRSS.value);
-  } else {
-    console.log(`❌ RSS falló completamente: ${noticiasRSS.reason}`);
-  }
+  var todas = [];
+  if (resRSS.status === 'fulfilled') todas.push.apply(todas, resRSS.value);
+  else console.log('❌ RSS falló completamente: ' + resRSS.reason);
+  if (resGDELT.status === 'fulfilled') todas.push.apply(todas, resGDELT.value);
+  else console.log('❌ GDELT falló completamente: ' + resGDELT.reason);
+  if (resWeb.status === 'fulfilled') todas.push.apply(todas, resWeb.value);
+  else console.log('❌ Web Search falló completamente: ' + resWeb.reason);
 
-  if (noticiasGDELT.status === 'fulfilled') {
-    todas.push(...noticiasGDELT.value);
-  } else {
-    console.log(`❌ GDELT falló completamente: ${noticiasGDELT.reason}`);
-  }
-
-  if (noticiasWeb.status === 'fulfilled') {
-    todas.push(...noticiasWeb.value);
-  } else {
-    console.log(`❌ Web Search falló completamente: ${noticiasWeb.reason}`);
-  }
-
-  // Eliminar duplicados
-  const vistos = new Set();
-  const unicos = [];
-  todas.forEach(item => {
-    const key = item.titulo.toLowerCase().trim().substring(0, 80);
+  var vistos = new Set();
+  var unicos = [];
+  todas.forEach(function (item) {
+    var key = item.titulo.toLowerCase().trim().substring(0, 80);
     if (!vistos.has(key)) {
       vistos.add(key);
       unicos.push(item);
     }
   });
 
-  console.log(`📊 TOTAL ÚNICAS: ${unicos.length} noticias`);
-  return unicos.slice(0, CONFIG.MAX_NOTICIAS_TOTAL);
+  console.log('📊 TOTAL ÚNICAS: ' + unicos.length + ' noticias | detalle=', diagnostico);
+  return { noticias: unicos.slice(0, CONFIG.MAX_NOTICIAS_TOTAL), diagnostico: diagnostico };
 }
 
-// ===================== GENERAR RESUMEN CON GEMINI =====================
-
+// ===================== GEMINI =====================
 async function generarResumenConIA(noticias, env) {
-  const apiKey = CONFIG.GEMINI_API_KEY;
+  var apiKey = obtenerApiKey(env, ['GEMINI_API_KEY', 'GEMINI_KEY', 'GOOGLE_AI_API_KEY']);
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY no configurada. Revisa CONFIG.GEMINI_API_KEY');
+    throw new Error('GEMINI_API_KEY no configurada. Usa: wrangler secret put GEMINI_API_KEY');
   }
 
-  const listaTexto = noticias
-    .map((n, i) => `${i + 1}. ${n.titulo} (Fuente: ${n.fuente}) - ${n.link}`)
+  var listaTexto = noticias
+    .map(function (n, i) {
+      return i + 1 + '. ' + n.titulo + ' (Fuente: ' + n.fuente + ') - ' + n.link;
+    })
     .join('\n');
 
-  const fechaHora = new Date().toLocaleString('es-ES', {
+  var fechaHora = new Date().toLocaleString('es-ES', {
     timeZone: 'America/New_York',
     dateStyle: 'short',
     timeStyle: 'short',
   });
 
-  const prompt = `
-Eres un analista OSINT senior especializado en inteligencia geopolítica, análisis de medios y vigilancia de narrativas.
+  var prompt =
+    '\nEres un analista OSINT senior especializado en inteligencia geopolítica, análisis de medios y vigilancia de narrativas.\n\n' +
+    'A partir de este listado de titulares de noticias del día, genera un resumen ejecutivo en español con este formato exacto:\n\n' +
+    '═══════════════════════════════════════════════════════════════\n' +
+    '📰 RESUMEN EJECUTIVO DE NOTICIAS - ' +
+    fechaHora +
+    ' (UTC-4)\n' +
+    '═══════════════════════════════════════════════════════════════\n\n' +
+    '1️⃣ PANORAMA GENERAL DEL DÍA (máximo 8 líneas)\n' +
+    '   - Síntesis de los eventos más relevantes\n' +
+    '   - Tendencias detectadas en los medios\n' +
+    '   - Cambios significativos en narrativas\n\n' +
+    '2️⃣ CUBA Y RELACIONES BILATERALES\n' +
+    '   📌 Noticias sobre política cubana, relaciones Cuba-EEUU, negociaciones, sanciones\n' +
+    '   📌 Tema migratorio, campañas contra el estado cubano, figuras del estado\n' +
+    '   📌 Marco Rubio, Donald Trump y política hacia Cuba\n' +
+    '   📌 Empresas que buscan invertir o negociar en Cuba\n' +
+    '   📌 Accidentes o eventos de desastre en Cuba\n\n' +
+    '3️⃣ POLÍTICA INTERNA Y EXTERNA DE EEUU\n' +
+    '   📌 Escándalos políticos, archivos Epstein, elecciones\n' +
+    '   📌 Conflictos, problemas sociales, campañas políticas\n' +
+    '   📌 Inmigración y política de Florida\n' +
+    '   📌 Diáspora/exilio cubano en Florida, Texas, New Jersey\n\n' +
+    '4️⃣ AMÉRICA LATINA\n' +
+    '   📌 Conflictos políticos, crisis, elecciones, movimientos sociales\n' +
+    '   📌 Relaciones intergubernamentales\n\n' +
+    '5️⃣ CONFLICTOS GLOBALES\n' +
+    '   📌 Ucrania-Rusia: avances, negociaciones, impacto global\n' +
+    '   📌 Irán-EEUU-Israel: escaladas, diplomacia, operaciones militares\n' +
+    '   📌 Oriente Medio: tensiones, acuerdos, desestabilización\n\n' +
+    '6️⃣ TECNOLOGÍA, OSINT, IA Y CIBERSEGURIDAD\n' +
+    '   📌 Nuevas herramientas OSINT y técnicas de investigación\n' +
+    '   📌 Avances en IA, regulaciones, aplicaciones\n' +
+    '   📌 Incidentes de ciberseguridad, amenazas, vulnerabilidades\n' +
+    '   📌 Big Data en inteligencia y análisis\n\n' +
+    '7️⃣ NOTICIAS DESTACADAS POR TEMA (agrupadas, máximo 10 puntos)\n' +
+    '   - Cada punto con 2-3 líneas de contexto y el link\n\n' +
+    '8️⃣ 🔍 SUGERENCIAS DE INVESTIGACIÓN OSINT (5-8 líneas)\n' +
+    '   - Temas que merecen profundización\n' +
+    '   - Justificación de por qué son relevantes\n' +
+    '   - Posibles fuentes o ángulos de investigación\n' +
+    '   - Conexiones entre noticias que sugieren patrones\n\n' +
+    '9️⃣ 📊 MÉTRICAS DEL DÍA\n' +
+    '   - Total de fuentes consultadas\n' +
+    '   - Medios más activos\n' +
+    '   - Temas dominantes\n\n' +
+    'REGLAS:\n' +
+    '- Sé objetivo, no tomes partido político\n' +
+    '- Destaca información verificada vs. especulación\n' +
+    '- Identifica posibles desinformación o narrativas coordinadas\n' +
+    '- Señala lagunas informativas que podrían ser intencionales\n' +
+    '- Usa emojis para mejorar legibilidad\n' +
+    '- Incluye los links completos de cada noticia destacada\n\n' +
+    'Titulares de hoy:\n' +
+    listaTexto +
+    '\n';
 
-A partir de este listado de titulares de noticias del día, genera un resumen ejecutivo en español con este formato exacto:
-
-═══════════════════════════════════════════════════════════════
-📰 RESUMEN EJECUTIVO DE NOTICIAS - ${fechaHora} (UTC-4)
-═══════════════════════════════════════════════════════════════
-
-1️⃣ PANORAMA GENERAL DEL DÍA (máximo 8 líneas)
-   - Síntesis de los eventos más relevantes
-   - Tendencias detectadas en los medios
-   - Cambios significativos en narrativas
-
-2️⃣ CUBA Y RELACIONES BILATERALES
-   📌 Noticias sobre política cubana, relaciones Cuba-EEUU, negociaciones, sanciones
-   📌 Tema migratorio, campañas contra el estado cubano, figuras del estado
-   📌 Marco Rubio, Donald Trump y política hacia Cuba
-   📌 Empresas que buscan invertir o negociar en Cuba
-   📌 Accidentes o eventos de desastre en Cuba
-
-3️⃣ POLÍTICA INTERNA Y EXTERNA DE EEUU
-   📌 Escándalos políticos, archivos Epstein, elecciones
-   📌 Conflictos, problemas sociales, campañas políticas
-   📌 Inmigración y política de Florida
-   📌 Diáspora/exilio cubano en Florida, Texas, New Jersey
-
-4️⃣ AMÉRICA LATINA
-   📌 Conflictos políticos, crisis, elecciones, movimientos sociales
-   📌 Relaciones intergubernamentales
-
-5️⃣ CONFLICTOS GLOBALES
-   📌 Ucrania-Rusia: avances, negociaciones, impacto global
-   📌 Irán-EEUU-Israel: escaladas, diplomacia, operaciones militares
-   📌 Oriente Medio: tensiones, acuerdos, desestabilización
-
-6️⃣ TECNOLOGÍA, OSINT, IA Y CIBERSEGURIDAD
-   📌 Nuevas herramientas OSINT y técnicas de investigación
-   📌 Avances en IA, regulaciones, aplicaciones
-   📌 Incidentes de ciberseguridad, amenazas, vulnerabilidades
-   📌 Big Data en inteligencia y análisis
-
-7️⃣ NOTICIAS DESTACADAS POR TEMA (agrupadas, máximo 10 puntos)
-   - Cada punto con 2-3 líneas de contexto y el link
-
-8️⃣ 🔍 SUGERENCIAS DE INVESTIGACIÓN OSINT (5-8 líneas)
-   - Temas que merecen profundización
-   - Justificación de por qué son relevantes
-   - Posibles fuentes o ángulos de investigación
-   - Conexiones entre noticias que sugieren patrones
-
-9️⃣ 📊 MÉTRICAS DEL DÍA
-   - Total de fuentes consultadas
-   - Medios más activos
-   - Temas dominantes
-
-REGLAS:
-- Sé objetivo, no tomes partido político
-- Destaca información verificada vs. especulación
-- Identifica posibles desinformación o narrativas coordinadas
-- Señala lagunas informativas que podrían ser intencionales
-- Usa emojis para mejorar legibilidad
-- Incluye los links completos de cada noticia destacada
-
-Titulares de hoy:
-${listaTexto}
-`;
-
-  const url = `${CONFIG.GEMINI_URL}?key=${apiKey}`;
-
-  const payload = {
+  var url = CONFIG.GEMINI_URL + '?key=' + apiKey;
+  var payload = {
     contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0.3,
-      maxOutputTokens: 8192,
-      topP: 0.8,
-      topK: 40,
-    },
+    generationConfig: { temperature: 0.3, maxOutputTokens: 8192, topP: 0.8, topK: 40 },
   };
 
-  const response = await fetchRobusto(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  }, 3); // 3 reintentos para Gemini
+  var response = await fetchRobusto(
+    url,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    3
+  );
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Gemini API error ${response.status}: ${errorText}`);
+    var errText = await response.text();
+    throw new Error('Gemini API error ' + response.status + ': ' + errText);
   }
-
-  const json = await response.json();
-
-  if (json.candidates?.[0]?.content?.parts?.[0]?.text) {
+  var json = await response.json();
+  if (json.candidates && json.candidates[0] && json.candidates[0].content && json.candidates[0].content.parts && json.candidates[0].content.parts[0] && json.candidates[0].content.parts[0].text) {
     return json.candidates[0].content.parts[0].text;
   } else if (json.error) {
     throw new Error('Gemini API error: ' + JSON.stringify(json.error));
@@ -676,420 +735,272 @@ ${listaTexto}
   }
 }
 
-// ===================== ENVIAR EMAIL (RESEND API - FREE TIER) =====================
-
-/**
- * Envía email usando Resend API (free tier: 100 emails/día).
- * 
- * VENTAJAS DEL PLAN FREE:
- * - No requiere Workers Paid ($0/mes)
- * - 100 emails/día gratis (~3,000/mes)
- * - Sin tarjeta de crédito para empezar
- * - SPF/DKIM/DMARC automático
- * - API key simple (Bearer token)
- * 
- * CONFIGURACIÓN:
- * 1. Crear cuenta en https://resend.com
- * 2. Verificar dominio o usar @resend.dev (instantáneo)
- * 3. Copiar API key
- * 4. Ejecutar: wrangler secret put EMAIL_API_KEY
- * 
- * LÍMITES FREE TIER:
- * - 100 emails/día
- * - Sin attachments
- * - Sin analytics avanzadas
- * - Sin custom domains (usa @resend.dev)
- * 
- * Para uso: 18 emails/día (3 envíos × 6 destinatarios) = cómodo en free tier
- */
+// ===================== ENVIAR EMAIL (RESEND) =====================
 async function enviarEmail(contenido, env) {
-  const emailApiKey = CONFIG.RESEND_API_KEY;
-
+  var emailApiKey = obtenerApiKey(env, ['EMAIL_API_KEY', 'RESEND_API_KEY']);
   if (!emailApiKey) {
-    console.log('⚠️ RESEND_API_KEY no configurada. Revisa CONFIG.RESEND_API_KEY');
-    console.log('   Para configurar:');
-    console.log('   API Key ya integrada en el código');
-    console.log('   Si necesitas cambiarla, edita CONFIG.RESEND_API_KEY');
-    console.log('   O usa: wrangler secret put EMAIL_API_KEY para sobreescribir');
-    return { 
-      enviados: 0, 
-      fallidos: CONFIG.EMAILS_DESTINO.length, 
-      error: 'EMAIL_API_KEY no configurada. Crea cuenta en resend.com (free tier)' 
+    console.log('⚠️ EMAIL_API_KEY / RESEND_API_KEY no configurada.');
+    console.log('   Configura con: wrangler secret put EMAIL_API_KEY');
+    return {
+      enviados: 0,
+      fallidos: CONFIG.EMAILS_DESTINO.length,
+      error:
+        'EMAIL_API_KEY no configurada. Crea cuenta en resend.com (free tier) y ejecuta: wrangler secret put EMAIL_API_KEY',
     };
   }
 
-  const fecha = new Date().toLocaleString('es-ES', {
+  var fecha = new Date().toLocaleString('es-ES', {
     timeZone: 'America/New_York',
     dateStyle: 'short',
     timeStyle: 'short',
   });
+  var subject = '📰 Resumen OSINT - ' + fecha + ' (UTC-4)';
+  var fromEmail = (env && env.FROM_EMAIL) || 'osint-resumen@resend.dev';
 
-  const subject = `📰 Resumen OSINT - ${fecha} (UTC-4)`;
+  var resultados = { enviados: 0, fallidos: 0, detalles: [] };
 
-  // Email de origen - Resend free tier usa @resend.dev
-  // Puedes cambiar a tu dominio verificado si tienes uno
-  const fromEmail = env.FROM_EMAIL || 'osint-resumen@resend.dev';
-
-  const resultados = { enviados: 0, fallidos: 0, detalles: [] };
-
-  for (const email of CONFIG.EMAILS_DESTINO) {
+  for (var k = 0; k < CONFIG.EMAILS_DESTINO.length; k++) {
+    var email = CONFIG.EMAILS_DESTINO[k];
     try {
-      const response = await fetchRobusto('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${emailApiKey}`,
+      var resp = await fetchRobusto(
+        'https://api.resend.com/emails',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer ' + emailApiKey,
+          },
+          body: JSON.stringify({
+            from: 'Sistema OSINT <' + fromEmail + '>',
+            to: [email],
+            subject: subject,
+            text: contenido,
+          }),
         },
-        body: JSON.stringify({
-          from: `Sistema OSINT <${fromEmail}>`,
-          to: [email],
-          subject: subject,
-          text: contenido,
-        }),
-      }, 2); // 2 reintentos para envío de email
-
-      if (response.ok) {
-        const data = await response.json();
-        console.log(`✅ Email enviado a: ${email} (ID: ${data.id})`);
+        2
+      );
+      if (resp.ok) {
+        var data = await resp.json();
+        console.log('✅ Email enviado a: ' + email + ' (ID: ' + data.id + ')');
         resultados.enviados++;
-        resultados.detalles.push({ email, status: 'ok', id: data.id });
+        resultados.detalles.push({ email: email, status: 'ok', id: data.id });
       } else {
-        const errorText = await response.text();
-        console.log(`❌ Error enviando a ${email}: HTTP ${response.status} - ${errorText}`);
+        var et = await resp.text();
+        console.log('❌ Error enviando a ' + email + ': HTTP ' + resp.status + ' - ' + et);
         resultados.fallidos++;
-        resultados.detalles.push({ email, status: 'error', error: errorText });
+        resultados.detalles.push({ email: email, status: 'error', error: et });
       }
     } catch (e) {
-      console.log(`❌ Error enviando a ${email}: ${e.message}`);
+      console.log('❌ Error enviando a ' + email + ': ' + e.message);
       resultados.fallidos++;
-      resultados.detalles.push({ email, status: 'error', error: e.message });
+      resultados.detalles.push({ email: email, status: 'error', error: e.message });
     }
   }
-
   return resultados;
 }
 
-
 // ===================== FUNCIÓN PRINCIPAL =====================
-
 async function ejecutarResumenCompleto(env) {
-  const inicio = Date.now();
-  const executionId = generarIdUnico();
-
-  console.log(`[${executionId}] 🚀 INICIANDO EJECUCIÓN COMPLETA`);
+  var inicio = Date.now();
+  var executionId = generarIdUnico();
+  console.log('[' + executionId + '] 🚀 INICIANDO EJECUCIÓN COMPLETA');
 
   try {
-    // 1. Obtener noticias
-    const noticias = await obtenerTodasLasNoticias(env);
+    var recolectado = await obtenerTodasLasNoticias();
+    var noticias = recolectado.noticias;
+    var diagnostico = recolectado.diagnostico;
 
     if (noticias.length === 0) {
-      console.log(`[${executionId}] ⚠️ No se encontraron noticias.`);
-      return { success: false, error: 'Sin noticias', executionId };
+      console.log('[' + executionId + '] ⚠️ No se encontraron noticias. Detalle:', diagnostico);
+      return {
+        success: false,
+        error: 'Sin noticias',
+        executionId: executionId,
+        detalle_fuentes: diagnostico,
+        tip:
+          'Prueba /test para revisar conectividad, /run/rss /run/gdelt /run/web por separado, y /status para ver API keys.',
+      };
     }
 
-    console.log(`[${executionId}] 📰 ${noticias.length} noticias obtenidas`);
+    console.log('[' + executionId + '] 📰 ' + noticias.length + ' noticias obtenidas');
+    console.log('[' + executionId + '] 🤖 Generando resumen con Gemini...');
+    var resumen = await generarResumenConIA(noticias, env);
+    console.log('[' + executionId + '] ✅ Resumen generado (' + resumen.length + ' caracteres)');
 
-    // 2. Generar resumen con IA
-    console.log(`[${executionId}] 🤖 Generando resumen con Gemini...`);
-    const resumen = await generarResumenConIA(noticias, env);
-    console.log(`[${executionId}] ✅ Resumen generado (${resumen.length} caracteres)`);
+    console.log('[' + executionId + '] 📧 Enviando emails...');
+    var emailResult = await enviarEmail(resumen, env);
+    console.log(
+      '[' +
+        executionId +
+        '] 📧 Emails: ' +
+        emailResult.enviados +
+        ' enviados, ' +
+        emailResult.fallidos +
+        ' fallidos'
+    );
 
-    // 3. Enviar email
-    console.log(`[${executionId}] 📧 Enviando emails...`);
-    const emailResult = await enviarEmail(resumen, env);
-    console.log(`[${executionId}] 📧 Emails: ${emailResult.enviados} enviados, ${emailResult.fallidos} fallidos`);
-
-    const duracion = ((Date.now() - inicio) / 1000).toFixed(2);
-    console.log(`[${executionId}] ✅ COMPLETADO en ${duracion}s`);
+    var duracion = ((Date.now() - inicio) / 1000).toFixed(2);
+    console.log('[' + executionId + '] ✅ COMPLETADO en ' + duracion + 's');
 
     return {
       success: true,
-      executionId,
+      executionId: executionId,
       duracionSegundos: parseFloat(duracion),
       noticias: noticias.length,
       emailsEnviados: emailResult.enviados,
       emailsFallidos: emailResult.fallidos,
       resumenPreview: resumen.substring(0, 200) + '...',
     };
-
   } catch (e) {
-    const duracion = ((Date.now() - inicio) / 1000).toFixed(2);
-    console.log(`[${executionId}] ❌ ERROR en ejecución: ${e.message}`);
-    console.log(`[${executionId}] Stack: ${e.stack}`);
-
+    var dur = ((Date.now() - inicio) / 1000).toFixed(2);
+    console.log('[' + executionId + '] ❌ ERROR en ejecución: ' + e.message);
+    console.log('[' + executionId + '] Stack: ' + e.stack);
     return {
       success: false,
-      executionId,
-      duracionSegundos: parseFloat(duracion),
+      executionId: executionId,
+      duracionSegundos: parseFloat(dur),
       error: e.message,
       stack: e.stack,
     };
   }
 }
 
-// ===================== ENDPOINTS HTTP PARA DISPARAR DESDE NAVEGADOR =====================
-
-/**
- * Endpoints disponibles (todos GET para facilitar uso desde navegador):
- * 
- * /              → Dashboard HTML con botones
- * /run           → Ejecutar resumen completo (RSS + GDELT + Web + Gemini + Email)
- * /run/rss       → Solo obtener noticias RSS
- * /run/gdelt     → Solo obtener noticias GDELT
- * /run/web       → Solo obtener noticias Web Search
- * /run/gemini    → Solo generar resumen con Gemini (requiere ?noticias=...)
- * /run/email     → Solo enviar email (requiere ?contenido=...)
- * /status        → Estado del worker y configuración
- * /test          → Test de conectividad
- */
-
+// ===================== DASHBOARD HTML =====================
 function generarDashboardHTML() {
-  return `<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🎯 OSINT News Aggregator</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { 
-      font-family: 'Segoe UI', system-ui, sans-serif; 
-      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-      min-height: 100vh; color: #e0e0e0; padding: 20px;
-    }
-    .container { max-width: 900px; margin: 0 auto; }
-    h1 { text-align: center; margin-bottom: 10px; font-size: 2.2em; }
-    .subtitle { text-align: center; color: #8892b0; margin-bottom: 30px; }
-    .card { 
-      background: rgba(255,255,255,0.05); 
-      border: 1px solid rgba(255,255,255,0.1);
-      border-radius: 16px; padding: 24px; margin-bottom: 20px;
-      backdrop-filter: blur(10px);
-    }
-    .card h2 { color: #64ffda; margin-bottom: 16px; font-size: 1.3em; }
-    .btn-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
-    .btn { 
-      display: flex; align-items: center; gap: 10px;
-      padding: 14px 20px; border: none; border-radius: 12px;
-      font-size: 15px; font-weight: 600; cursor: pointer;
-      transition: all 0.2s; text-decoration: none; color: white;
-    }
-    .btn-primary { background: linear-gradient(135deg, #667eea, #764ba2); }
-    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(102,126,234,0.4); }
-    .btn-success { background: linear-gradient(135deg, #11998e, #38ef7d); }
-    .btn-success:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(17,153,142,0.4); }
-    .btn-warning { background: linear-gradient(135deg, #f093fb, #f5576c); }
-    .btn-warning:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(240,147,251,0.4); }
-    .btn-info { background: linear-gradient(135deg, #4facfe, #00f2fe); }
-    .btn-info:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(79,172,254,0.4); }
-    .status-badge { 
-      display: inline-block; padding: 4px 12px; border-radius: 20px;
-      font-size: 12px; font-weight: 600; margin: 2px;
-    }
-    .status-ok { background: #00c853; color: #000; }
-    .status-warn { background: #ffd600; color: #000; }
-    .status-info { background: #2962ff; color: #fff; }
-    .destinatarios { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-    .destinatario { 
-      background: rgba(100,255,218,0.1); border: 1px solid rgba(100,255,218,0.3);
-      padding: 6px 14px; border-radius: 20px; font-size: 13px;
-    }
-    .cron-info { 
-      background: rgba(255,214,0,0.1); border: 1px solid rgba(255,214,0,0.3);
-      padding: 16px; border-radius: 12px; margin-top: 16px;
-    }
-    .cron-info h3 { color: #ffd600; margin-bottom: 8px; }
-    .feeds-list { 
-      max-height: 200px; overflow-y: auto; 
-      background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px;
-      font-family: monospace; font-size: 12px; line-height: 1.6;
-    }
-    .feeds-list::-webkit-scrollbar { width: 6px; }
-    .feeds-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
-    .loading { display: none; text-align: center; padding: 20px; }
-    .loading.active { display: block; }
-    .spinner { 
-      width: 40px; height: 40px; border: 3px solid rgba(255,255,255,0.1);
-      border-top-color: #64ffda; border-radius: 50%;
-      animation: spin 1s linear infinite; margin: 0 auto 10px;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    #resultado { 
-      margin-top: 16px; padding: 16px; border-radius: 12px;
-      background: rgba(0,0,0,0.3); font-family: monospace; font-size: 13px;
-      white-space: pre-wrap; display: none; max-height: 400px; overflow-y: auto;
-    }
-    #resultado.active { display: block; }
-    .footer { text-align: center; margin-top: 30px; color: #8892b0; font-size: 13px; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>🎯 OSINT News Aggregator</h1>
-    <p class="subtitle">Inteligencia automatizada con Gemini AI | Cloudflare Worker</p>
+  var mails = CONFIG.EMAILS_DESTINO.map(function (e) {
+    return '<span class="destinatario">' + e + '</span>';
+  }).join('');
+  var feeds = TODOS_LOS_FEEDS.map(function (f, i) {
+    return i + 1 + '. ' + f;
+  }).join('<br>');
 
-    <div class="card">
-      <h2>🚀 Ejecutar desde Navegador</h2>
-      <div class="btn-grid">
-        <a href="/run" class="btn btn-primary" onclick="return ejecutar(this)">📰 Resumen Completo</a>
-        <a href="/run/rss" class="btn btn-success" onclick="return ejecutar(this)">📡 Solo RSS</a>
-        <a href="/run/gdelt" class="btn btn-success" onclick="return ejecutar(this)">🌍 Solo GDELT</a>
-        <a href="/run/web" class="btn btn-success" onclick="return ejecutar(this)">🔍 Solo Web Search</a>
-        <a href="/status" class="btn btn-info">📊 Estado del Sistema</a>
-        <a href="/test" class="btn btn-warning">🧪 Test de Conectividad</a>
-      </div>
-      <div class="loading" id="loading">
-        <div class="spinner"></div>
-        <p>Ejecutando... esto puede tomar 30-60 segundos</p>
-      </div>
-      <pre id="resultado"></pre>
-    </div>
-
-    <div class="card">
-      <h2>📧 Destinatarios Configurados (${CONFIG.EMAILS_DESTINO.length})</h2>
-      <div class="destinatarios">
-        ${CONFIG.EMAILS_DESTINO.map(e => `<span class="destinatario">${e}</span>`).join('')}
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>⏰ Programación Automática (Cron)</h2>
-      <div class="cron-info">
-        <h3>🕐 7:00 AM | 🕐 1:00 PM | 🕐 7:00 PM (UTC-4)</h3>
-        <p>Se ejecuta automáticamente sin intervención. También puedes disparar manualmente con los botones de arriba.</p>
-        <p><strong>Cron expressions:</strong> <code>0 11 * * *</code>, <code>0 17 * * *</code>, <code>0 23 * * *</code> (UTC)</p>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>📡 Fuentes RSS Configuradas (${TODOS_LOS_FEEDS.length})</h2>
-      <div class="feeds-list">
-        ${TODOS_LOS_FEEDS.map((f, i) => `${i + 1}. ${f}`).join('<br>')}
-      </div>
-    </div>
-
-    <div class="footer">
-      <p>OSINT News Aggregator v1.0 | Cloudflare Workers | Gemini AI | Resend Email</p>
-      <p>Desarrollado para análisis de inteligencia geopolítica</p>
-    </div>
-  </div>
-
-  <script>
-    async function ejecutar(link) {
-      const loading = document.getElementById('loading');
-      const resultado = document.getElementById('resultado');
-      loading.classList.add('active');
-      resultado.classList.remove('active');
-      resultado.textContent = '';
-
-      try {
-        const response = await fetch(link.href);
-        const data = await response.json();
-        resultado.textContent = JSON.stringify(data, null, 2);
-        resultado.classList.add('active');
-      } catch (e) {
-        resultado.textContent = 'Error: ' + e.message;
-        resultado.classList.add('active');
-      } finally {
-        loading.classList.remove('active');
-      }
-      return false;
-    }
-  </script>
-</body>
-</html>`;
+  return (
+    '<!DOCTYPE html>\n<html lang="es"><head><meta charset="UTF-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1.0">' +
+    '<title>🎯 OSINT News Aggregator</title>' +
+    '<style>' +
+    '*{margin:0;padding:0;box-sizing:border-box}body{font-family:Segoe UI,system-ui,sans-serif;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);min-height:100vh;color:#e0e0e0;padding:20px}' +
+    '.container{max-width:900px;margin:0 auto}h1{text-align:center;margin-bottom:10px;font-size:2.2em}' +
+    '.subtitle{text-align:center;color:#8892b0;margin-bottom:30px}' +
+    '.card{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:24px;margin-bottom:20px;backdrop-filter:blur(10px)}' +
+    '.card h2{color:#64ffda;margin-bottom:16px;font-size:1.3em}' +
+    '.btn-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}' +
+    '.btn{display:flex;align-items:center;gap:10px;padding:14px 20px;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;transition:all .2s;text-decoration:none;color:white}' +
+    '.btn-primary{background:linear-gradient(135deg,#667eea,#764ba2)}.btn-primary:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(102,126,234,.4)}' +
+    '.btn-success{background:linear-gradient(135deg,#11998e,#38ef7d)}.btn-success:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(17,153,142,.4)}' +
+    '.btn-warning{background:linear-gradient(135deg,#f093fb,#f5576c)}.btn-warning:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(240,147,251,.4)}' +
+    '.btn-info{background:linear-gradient(135deg,#4facfe,#00f2fe)}.btn-info:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(79,172,254,.4)}' +
+    '.destinatarios{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.destinatario{background:rgba(100,255,218,.1);border:1px solid rgba(100,255,218,.3);padding:6px 14px;border-radius:20px;font-size:13px}' +
+    '.cron-info{background:rgba(255,214,0,.1);border:1px solid rgba(255,214,0,.3);padding:16px;border-radius:12px;margin-top:16px}.cron-info h3{color:#ffd600;margin-bottom:8px}' +
+    '.feeds-list{max-height:200px;overflow-y:auto;background:rgba(0,0,0,.2);padding:12px;border-radius:8px;font-family:monospace;font-size:12px;line-height:1.6}' +
+    '.feeds-list::-webkit-scrollbar{width:6px}.feeds-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.2);border-radius:3px}' +
+    '.loading{display:none;text-align:center;padding:20px}.loading.active{display:block}' +
+    '.spinner{width:40px;height:40px;border:3px solid rgba(255,255,255,.1);border-top-color:#64ffda;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 10px}' +
+    '@keyframes spin{to{transform:rotate(360deg)}}' +
+    '#resultado{margin-top:16px;padding:16px;border-radius:12px;background:rgba(0,0,0,.3);font-family:monospace;font-size:13px;white-space:pre-wrap;display:none;max-height:400px;overflow-y:auto}' +
+    '#resultado.active{display:block}' +
+    '.footer{text-align:center;margin-top:30px;color:#8892b0;font-size:13px}' +
+    '</style></head><body>' +
+    '<div class="container"><h1>🎯 OSINT News Aggregator</h1>' +
+    '<p class="subtitle">Inteligencia automatizada con Gemini AI | Cloudflare Worker</p>' +
+    '<div class="card"><h2>🚀 Ejecutar desde Navegador</h2>' +
+    '<div class="btn-grid">' +
+    '<a href="/run" class="btn btn-primary" onclick="return ejecutar(this)">📰 Resumen Completo</a>' +
+    '<a href="/run/rss" class="btn btn-success" onclick="return ejecutar(this)">📡 Solo RSS</a>' +
+    '<a href="/run/gdelt" class="btn btn-success" onclick="return ejecutar(this)">🌍 Solo GDELT</a>' +
+    '<a href="/run/web" class="btn btn-success" onclick="return ejecutar(this)">🔍 Solo Web Search</a>' +
+    '<a href="/status" class="btn btn-info">📊 Estado del Sistema</a>' +
+    '<a href="/test" class="btn btn-warning">🧪 Test de Conectividad</a>' +
+    '</div>' +
+    '<div class="loading" id="loading"><div class="spinner"></div><p>Ejecutando... esto puede tomar 30-60 segundos</p></div>' +
+    '<pre id="resultado"></pre></div>' +
+    '<div class="card"><h2>📧 Destinatarios Configurados (' +
+    CONFIG.EMAILS_DESTINO.length +
+    ')</h2><div class="destinatarios">' +
+    mails +
+    '</div></div>' +
+    '<div class="card"><h2>⏰ Programación Automática (Cron)</h2>' +
+    '<div class="cron-info"><h3>🕐 7:00 AM | 🕐 1:00 PM | 🕐 7:00 PM (UTC-4)</h3>' +
+    '<p>Se ejecuta automáticamente sin intervención. También puedes disparar manualmente con los botones de arriba.</p>' +
+    '<p><strong>Cron expressions:</strong> <code>0 11 * * *</code>, <code>0 17 * * *</code>, <code>0 23 * * *</code> (UTC)</p>' +
+    '</div></div>' +
+    '<div class="card"><h2>📡 Fuentes RSS Configuradas (' +
+    TODOS_LOS_FEEDS.length +
+    ')</h2><div class="feeds-list">' +
+    feeds +
+    '</div></div>' +
+    '<div class="footer"><p>OSINT News Aggregator v1.0 | Cloudflare Workers | Gemini AI | Resend Email</p>' +
+    '<p>Desarrollado para análisis de inteligencia geopolítica</p></div></div>' +
+    '<script>async function ejecutar(link){const l=document.getElementById("loading"),r=document.getElementById("resultado");l.classList.add("active");r.classList.remove("active");r.textContent="";try{const res=await fetch(link.href);const data=await res.json();r.textContent=JSON.stringify(data,null,2);r.classList.add("active")}catch(e){r.textContent="Error: "+e.message;r.classList.add("active")}finally{l.classList.remove("active")}return false}</script>' +
+    '</body></html>'
+  );
 }
 
 // ===================== HANDLER PRINCIPAL =====================
+var CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
+
+function jsonResponse(obj, status) {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status: status || 200,
+    headers: Object.assign({ 'Content-Type': 'application/json' }, CORS),
+  });
+}
 
 export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    // CORS headers para peticiones desde cualquier origen
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    };
+  async fetch(request, env) {
+    var url = new URL(request.url);
+    var path = url.pathname;
 
     if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
+      return new Response(null, { headers: CORS });
     }
 
     try {
-      // ─── DASHBOARD HTML ───
       if (path === '/' || path === '/index.html') {
         return new Response(generarDashboardHTML(), {
-          headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders },
+          headers: Object.assign({ 'Content-Type': 'text/html; charset=utf-8' }, CORS),
         });
       }
 
-      // ─── EJECUTAR RESUMEN COMPLETO ───
       if (path === '/run') {
-        const resultado = await ejecutarResumenCompleto(env);
-        return new Response(JSON.stringify(resultado, null, 2), {
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-          status: resultado.success ? 200 : 500,
-        });
+        var rFull = await ejecutarResumenCompleto(env);
+        return jsonResponse(rFull, rFull.success ? 200 : 500);
       }
 
-      // ─── SOLO RSS ───
       if (path === '/run/rss') {
-        const noticias = await obtenerNoticiasRSS(env);
-        return new Response(JSON.stringify({
-          success: true,
-          fuente: 'RSS',
-          total: noticias.length,
-          noticias: noticias,
-        }, null, 2), {
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        });
+        var nRss = await obtenerNoticiasRSS();
+        return jsonResponse({ success: true, fuente: 'RSS', total: nRss.length, noticias: nRss });
       }
 
-      // ─── SOLO GDELT ───
       if (path === '/run/gdelt') {
-        const noticias = await obtenerNoticiasGDELT(env);
-        return new Response(JSON.stringify({
-          success: true,
-          fuente: 'GDELT',
-          total: noticias.length,
-          noticias: noticias,
-        }, null, 2), {
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        });
+        var nG = await obtenerNoticiasGDELT();
+        return jsonResponse({ success: true, fuente: 'GDELT', total: nG.length, noticias: nG });
       }
 
-      // ─── SOLO WEB SEARCH ───
       if (path === '/run/web') {
-        const noticias = await obtenerNoticiasBusquedaWeb(env);
-        return new Response(JSON.stringify({
-          success: true,
-          fuente: 'Web Search',
-          total: noticias.length,
-          noticias: noticias,
-        }, null, 2), {
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        });
+        var nW = await obtenerNoticiasBusquedaWeb();
+        return jsonResponse({ success: true, fuente: 'Web Search', total: nW.length, noticias: nW });
       }
 
-      // ─── ESTADO DEL SISTEMA ───
       if (path === '/status') {
-        const geminiConfigured = !!CONFIG.GEMINI_API_KEY;
-        const emailConfigured = !!CONFIG.RESEND_API_KEY;
-
-        return new Response(JSON.stringify({
+        var gk = !!obtenerApiKey(env, ['GEMINI_API_KEY', 'GEMINI_KEY', 'GOOGLE_AI_API_KEY']);
+        var ek = !!obtenerApiKey(env, ['EMAIL_API_KEY', 'RESEND_API_KEY']);
+        return jsonResponse({
           success: true,
           worker: 'osint-news-aggregator',
-          version: '1.0.0',
+          version: '1.0.1',
           timestamp: new Date().toISOString(),
           configuracion: {
-            gemini_api: geminiConfigured ? '✅ Configurada' : '❌ No configurada (wrangler secret put GEMINI_API_KEY)',
-            email_api: emailConfigured ? '✅ Configurada' : '❌ No configurada (wrangler secret put EMAIL_API_KEY)',
+            gemini_api: gk ? '✅ Configurada' : '❌ No configurada (wrangler secret put GEMINI_API_KEY)',
+            email_api: ek ? '✅ Configurada' : '❌ No configurada (wrangler secret put EMAIL_API_KEY)',
             destinatarios: CONFIG.EMAILS_DESTINO.length,
             feeds_rss: TODOS_LOS_FEEDS.length,
             cron_triggers: ['7:00 AM', '1:00 PM', '7:00 PM (UTC-4)'],
+            domparser: domParserDisponible() ? 'disponible' : 'fallback regex',
           },
           endpoints: {
             '/': 'Dashboard HTML',
@@ -1100,107 +1011,94 @@ export default {
             '/status': 'Estado del sistema',
             '/test': 'Test de conectividad',
           },
-        }, null, 2), {
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
       }
 
-      // ─── TEST DE CONECTIVIDAD ───
       if (path === '/test') {
-        const tests = [];
+        var tests = [];
 
-        // Test Gemini
+        var geminiKey = obtenerApiKey(env, ['GEMINI_API_KEY', 'GEMINI_KEY', 'GOOGLE_AI_API_KEY']);
         try {
-          const geminiTest = await fetchRobusto(
-            `https://generativelanguage.googleapis.com/v1beta/models?key=${CONFIG.GEMINI_API_KEY}`,
-            {}, 1
+          if (!geminiKey) throw new Error('API key no configurada');
+          var tG = await fetchRobusto(
+            'https://generativelanguage.googleapis.com/v1beta/models?key=' + geminiKey,
+            {},
+            1
           );
-          tests.push({ servicio: 'Gemini API', status: geminiTest.ok ? '✅ OK' : '⚠️ Respuesta ' + geminiTest.status });
+          tests.push({ servicio: 'Gemini API', status: tG.ok ? '✅ OK' : '⚠️ Respuesta ' + tG.status });
         } catch (e) {
           tests.push({ servicio: 'Gemini API', status: '❌ Error: ' + e.message });
         }
 
-        // Test RSS
         try {
-          const rssTest = await fetchRobusto('https://feeds.bbci.co.uk/news/world/rss.xml', {}, 1);
-          tests.push({ servicio: 'RSS (BBC)', status: rssTest.ok ? '✅ OK' : '⚠️ ' + rssTest.status });
+          var tR = await fetchRobusto('https://feeds.bbci.co.uk/news/world/rss.xml', {}, 1);
+          tests.push({ servicio: 'RSS (BBC)', status: tR.ok ? '✅ OK' : '⚠️ ' + tR.status });
         } catch (e) {
           tests.push({ servicio: 'RSS (BBC)', status: '❌ Error: ' + e.message });
         }
 
-        // Test GDELT
         try {
-          const gdeltTest = await fetchRobusto(
+          var tGD = await fetchRobusto(
             'https://api.gdeltproject.org/api/v2/doc/doc?query=Cuba&mode=ArtList&maxrecords=1&format=json',
-            {}, 1
+            {},
+            1
           );
-          tests.push({ servicio: 'GDELT API', status: gdeltTest.ok ? '✅ OK' : '⚠️ ' + gdeltTest.status });
+          tests.push({ servicio: 'GDELT API', status: tGD.ok ? '✅ OK' : '⚠️ ' + tGD.status });
         } catch (e) {
           tests.push({ servicio: 'GDELT API', status: '❌ Error: ' + e.message });
         }
 
-        // Test Email
+        var emailKey = obtenerApiKey(env, ['EMAIL_API_KEY', 'RESEND_API_KEY']);
         try {
-          const emailTest = await fetchRobusto('https://api.resend.com/emails', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${CONFIG.RESEND_API_KEY}` },
-            body: JSON.stringify({}),
-          }, 1);
-          tests.push({ servicio: 'Resend Email', status: emailTest.ok ? '✅ OK' : '⚠️ Auth requerida (' + emailTest.status + ')' });
+          if (!emailKey) throw new Error('API key no configurada');
+          var tE = await fetchRobusto(
+            'https://api.resend.com/emails',
+            {
+              method: 'POST',
+              headers: { Authorization: 'Bearer ' + emailKey },
+              body: JSON.stringify({}),
+            },
+            1
+          );
+          tests.push({
+            servicio: 'Resend Email',
+            status: tE.ok ? '✅ OK' : '⚠️ Auth requerida (' + tE.status + ')',
+          });
         } catch (e) {
           tests.push({ servicio: 'Resend Email', status: '❌ Error: ' + e.message });
         }
 
-        return new Response(JSON.stringify({
-          success: true,
-          timestamp: new Date().toISOString(),
-          tests: tests,
-        }, null, 2), {
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        });
+        return jsonResponse({ success: true, timestamp: new Date().toISOString(), tests: tests });
       }
 
-      // ─── 404 ───
-      return new Response(JSON.stringify({
-        success: false,
-        error: 'Endpoint no encontrado',
-        endpoints_disponibles: ['/', '/run', '/run/rss', '/run/gdelt', '/run/web', '/status', '/test'],
-      }, null, 2), {
-        status: 404,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders },
-      });
-
+      return jsonResponse(
+        {
+          success: false,
+          error: 'Endpoint no encontrado',
+          endpoints_disponibles: ['/', '/run', '/run/rss', '/run/gdelt', '/run/web', '/status', '/test'],
+        },
+        404
+      );
     } catch (e) {
       console.error('Error en handler:', e);
-      return new Response(JSON.stringify({
-        success: false,
-        error: e.message,
-        stack: e.stack,
-      }, null, 2), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders },
-      });
+      return jsonResponse({ success: false, error: e.message, stack: e.stack }, 500);
     }
   },
 
-  // ===================== CRON TRIGGER =====================
-  async scheduled(event, env, ctx) {
-    console.log(`⏰ Cron trigger ejecutado: ${event.cron} (${new Date().toISOString()})`);
-
-    // Ejecutar el resumen completo
-    const resultado = await ejecutarResumenCompleto(env);
-
-    console.log(`⏰ Cron finalizado: ${JSON.stringify(resultado)}`);
-
-    // Guardar log en KV si está disponible (opcional)
+  async scheduled(event, env) {
+    console.log('⏰ Cron trigger ejecutado: ' + event.cron + ' (' + new Date().toISOString() + ')');
+    var resultado = await ejecutarResumenCompleto(env);
+    console.log('⏰ Cron finalizado: ' + JSON.stringify(resultado));
     if (env.OSINT_LOGS) {
       try {
         await env.OSINT_LOGS.put(
-          `log-${Date.now()}`,
-          JSON.stringify({ cron: event.cron, ...resultado, timestamp: new Date().toISOString() })
+          'log-' + Date.now(),
+          JSON.stringify(
+            Object.assign({ cron: event.cron, timestamp: new Date().toISOString() }, resultado)
+          )
         );
       } catch (e) {
-        console.log('No se pudo guardar log en KV:', e.message);
+        console.log('No se pudo guardar log en KV: ' + e.message);
       }
     }
   },
